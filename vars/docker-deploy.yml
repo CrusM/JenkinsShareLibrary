@@ -1,0 +1,31 @@
+- name: deploy docker project
+  hosts: "{{ hosts }}"
+  tasks:
+    # 登录容器仓库
+    - name: install tools docker-py
+      shell: pip install docker
+      
+    - name: login into private registry
+      docker_login:
+        registry: harbor
+        username: admin
+        password: 123456
+        reauthorize: yes
+
+    - name: stop and remove old container
+      docker_container: 
+        name: "{{ project }}"
+        state: absent
+
+    - name: create and run news container
+      docker_container: 
+        name: "{{ project}}"
+        image: "{{ image}}"
+        ports:
+          - "{{ PORT }}:{{ PORT }}"
+        env:
+          MAXMEM: "{{ MAXMEM }}"
+          PROFILEACTIVE: "{{ active }}"
+          APPID: "{{ APPID }}"
+          SERVER_PORT: "{{ PORT }}"
+          HOST_IP: "{{ ansible_default_ipv4.address }}"
