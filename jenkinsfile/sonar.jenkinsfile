@@ -1,0 +1,129 @@
+#!groovy
+@Library('JpipelineLibrary') _
+
+def sonar = new org.devops.sonarqube()
+def sonarApi = new org.devops.sonarApi()
+def gitlab = new org.devops.gitlab()
+
+pipeline {
+    agent { label 'sonar' }
+    tools {
+            maven 'mvn3.6'
+            jdk 'jdk8'
+            gradle 'gradle4'
+            nodejs 'nodejs13'
+        }
+    options {
+            // 不允许并发构建
+            disableConcurrentBuilds()
+            // 保留历史构建数量
+            buildDiscarder(logRotator(numToKeepStr: '5'))
+        }
+    parameters {
+        string(name: "sonar", defaultValue: "sonar", description: "sonar")
+    }
+    environment{
+            projectPath = "src"
+            __workspace = "."
+        }
+    
+    stages {
+        //
+        stage("init") {
+            steps {
+                script {
+                    response = readJSON text: """${webHookData}"""
+                    env.branch = "${response.ref}" - "refs/heads/"
+                    env.gitUrl = "${response.project.git_http_url}"
+                    env.projectName = "${response.project.name}"
+                    env.projectDesc = "${response.project.namespace}:${projectName}"
+                    env.author = "${response.user_name}"
+                    env.__tool = "${tool}"
+
+                    // 添加详细描述
+                    currentBuild.description = "扫描项目：${projectName} \n"
+                    currentBuild.description += "分支： ${branch} \n"
+                    currentBuild.description += "提交人：${author} \n"
+                    currentBuild.description += "commit id：${commit_sha}"
+                }
+                
+            }
+        }
+        // 检出代码
+        stage("checkCode") {
+            steps {
+                script{
+                    checkout([$class: 'GitSCM',
+                        branches: [[name: "${branch}"]],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [],
+                        gitTool: 'Default',
+                        submoduleCfg: [],
+                        userRemoteConfigs: [[url: "${gitUrl}",credentialsId: "git-access-token"]]
+                    ])
+                }
+                
+            }
+        }
+        // java项目编译
+        stage("build") {
+            steps {
+                script {
+                    try{
+                        ZbuildCode(" ")
+                    } catch(e) {
+                        gitlab.ChangeCommitStatus(projectId, commit_sha, "failed", "${__tool}_code_build_failed!")
+                        error("编译失败")
+                    }
+                }
+            }
+        }
+        // 扫描
+        stage('sonar') {
+            steps {
+                println("开始扫描： language: ${language}")
+                script {
+
+                    if("${language}" == "java") {
+                        sonar.SonarScanJava(projectDesc,projectName,projectPath)
+                    } else if("${language}" == "HTML") {
+                        sonar.SonarScanHTML(projectDesc,projectName,projectPath)
+                    }
+                    
+                    // 获取扫描
+                    sleep 10
+                    result = sonarApi.GetProjectStatus("${projectDesc}")
+                    
+                    if (result.toString() == "ERROR"){
+                        // toemail.Email("代码质量阈错误！请及时修复！",userEmail)
+                        error " 代码质量阈错误！请及时修复！"
+                    } else {
+                        println(result)
+                    }
+                } 
+            }
+        }
+
+        // 发送报告
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+
+        // success {
+        //     // 修改gitlab commit状态
+        //     script{
+        //         gitlab.ChangeCommitStatus(projectId, commit_sha, "success")
+        //     }
+        // }
+
+        // failure {
+        //     // 修改gitlab commit状态
+        //     script{
+        //         gitlab.ChangeCommitStatus(projectId, commit_sha, "failed")
+        //     }
+        // }
+    }
+}
