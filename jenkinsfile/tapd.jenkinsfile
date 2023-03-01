@@ -1,0 +1,284 @@
+#!groovy
+// 腾讯tapd + jenkins + gitlab, CI/CD 流水线
+// 提交 需求,BUG 自动创建对应的 DEV-STORY-{tapd_id} 分支
+// 需求关闭, 自动创建合并请求, 将代码合并到 Release 分支
+
+@Library('JpipelineLibrary') _
+
+
+def gitlab = new org.devops.gitlab()
+def tapd = new org.devops.tapd()
+def tools = new org.devops.tools()
+def sourceBranch = "master"
+
+pipeline {
+    agent any
+    options {
+            // 不允许并行构建
+            disableConcurrentBuilds()
+            // 保留历史构建数量
+            buildDiscarder(logRotator(numToKeepStr: '15'))
+        }
+
+    // Webhook 触发器
+    triggers {
+        GenericTrigger(causeString: 'Generic Cause', 
+                        genericVariables: [[defaultValue: '', key: 'webHookData', regexpFilter: '', value: '$.']], 
+                        regexpFilterExpression: '', 
+                        regexpFilterText: '', 
+                        token: 'jenkinslib', 
+                        tokenCredentialId: ''
+                    )
+    }
+    stages {
+        stage("解析webhook数据") {
+            steps {
+                script {
+                    response = readJSON text: """${webHookData}"""
+                    env.eventType = response["event"]
+                    env.userName = response["current_user"]
+                    env.responseId = response["id"]
+                    env.workspace_id = response["workspace_id"]
+                    def choiceCase = eventType.split(":")[0]
+                    switch(choiceCase) {
+                        // 创建BUG
+                        case "bug":
+                            BugResponse = tapd.GetInfoApi("bugs",["workspace_id":"${workspace_id}", "id":"${responseId}" ])
+                            data = readJSON text: """${BugResponse.content}"""
+                            BugInfo = data["data"]["Bug"]
+                            env.Description = BugInfo["description"]
+                            env.moduleName = BugInfo["module"]
+                            env.jobName = BugInfo["title"]
+                            env.status = BugInfo["status"]
+                            env.fixVersion = BugInfo["version_report"]
+                            currentBuild.description = " Trigger by ${userName} 新建BUG ${jobName}"
+                            break
+                        // 需求变更
+                        case "story":
+                            StoryResponse = tapd.GetInfoApi("stories", ["workspace_id":"${workspace_id}" ,"id":"${responseId}" ])
+                            data = readJSON text: """${StoryResponse.content}"""
+                            StoryInfo = data["data"]["Story"]
+                            env.Description = StoryInfo["description"]
+                            env.moduleName = StoryInfo["module"]
+                            env.jobName = StoryInfo["name"]
+                            env.status = StoryInfo["status"]
+                            env.fixVersion = StoryInfo["version"]
+                            currentBuild.description = " Trigger by ${userName} 变更需求 ${responseId}"
+                            break
+                        case "launchform":
+                            LaunchResponse = tapd.GetInfoApi("launch_forms", ["workspace_id":"${workspace_id}", "id":"${responseId}"])
+                            data = readJSON text: """${LaunchResponse.content}"""
+                            LaunchInfo = data["data"]["LaunchForm"]
+                            env.Description = LaunchInfo["title"]
+                            env.jobName = LaunchInfo["name"]
+                            env.status = LaunchInfo["status"]
+                            env.fixVersion = LaunchInfo["roadmap_version"]
+                            currentBuild.description = " Trigger by ${userName} 变更发布评审 ${responseId}"
+                        default:
+                            tools.PrintMSG("red",'tapd event type ${eventType}')
+                    }
+                }
+            }  
+        }
+
+        stage("需求操作") {
+            // 需求状态字段 status：
+            //                    规划中 ： planning
+            //                    实现中 :  developing
+            //                    已实现 ： resolved
+            when {
+                anyOf {
+                    environment name: "eventType", value: "story::update"
+                    environment name: "eventType", value: "story::create"
+                }
+            }
+
+            steps {
+                script {
+                    // 关联模块
+                    if ("${moduleName}".length() > 0 ) {
+                        tools.PrintMSG("blue","""ProjectName:${moduleName}""")
+                        currentBuild.description += "\n Project: ${moduleName}"
+                        try {
+                            ProjectId = gitlab.GetProjectId("${moduleName}")
+                            tools.PrintMSG("blue","""ProjectName:${moduleName},ProjectId:${ProjectId}""")
+                        } catch(e) {
+                            error("未找到关联项目ID,请检测关联模块名称！")
+                        }
+                        
+                        // 新建特性分支
+                        tools.PrintMSG("blue","新建特性分支 --> ${moduleName} --> DEV-${workspace_id}-${responseId}")
+                        gitlab.CreateProjectBranch(ProjectId, "${sourceBranch}", "DEV-STORY-${workspace_id}-${responseId}")
+                        currentBuild.description += "\n新建需求特性分支 --> ${moduleName} --> DEV-STORY-${workspace_id}-${responseId}"
+
+                        if("${status}" == "resolved") {
+                            // 有关联版本，创建release分支，新建合并请求
+                            tools.PrintMSG("blue","创建Release --> ${moduleName} -->${fixVersion}分支")
+                            gitlab.CreateProjectBranch(ProjectId, "${sourceBranch}", "RELEASE-${fixVersion}")
+
+                            tools.PrintMSG("blue","创建合并请求 DEV-${workspace_id}-${responseId} ---> RELEASE-${fixVersion}")
+                            gitlab.CreateProjectMR(ProjectId, "DEV-STORY-${workspace_id}-${responseId}", "RELEASE-${fixVersion}", "${jobName}","${Description}")
+                            currentBuild.description += " \nIssue关联release, Jenkins创建合并请求 \nDEV-${workspace_id}-${responseId} --> release-${fixVersion}"
+                        }
+                    } else {
+                        tools.PrintMSG("blue","""ProjectName:${moduleName}""")
+                        currentBuild.description += "\n 没有关联模块"
+                    }
+                }
+            }
+        }
+
+        stage("缺陷(BUG)操作") {
+            when {
+                allOf {
+                    anyOf {
+                        environment name: "eventType", value: "bug::update"
+                        environment name: "eventType", value: "bug::create"
+                    }
+                    anyOf {
+                        environment name: "status", value: "new"
+                        environment name: "status", value: "in_progress"
+                        environment name: "status", value: "resolved"
+                        environment name: "status", value: "reopened"
+                        environment name: "status", value: "verified"
+                    }
+                }
+                
+            }
+
+            steps {
+                script {
+                    // status ：
+                    //         new              新建
+                    //         in_progress      接受/处理
+                    //         resolved         已解决
+                    //         verified         已验证
+                    //         reopened         重新打开
+                    //         rejected         已拒绝
+                    //         closed           已关闭
+                    // 关联模块
+                    // 没有关联模块则不进行操作
+                    if ( "${moduleName}" != "null" ) {
+                        tools.PrintMSG("blue","""ProjectName:${moduleName}""")
+                        currentBuild.description += "\n Project: ${moduleName}"
+                        try {
+                            ProjectId = gitlab.GetProjectId("${moduleName}")
+                            tools.PrintMSG("blue","""ProjectName:${moduleName},ProjectId:${ProjectId}""")
+                        } catch(e) {
+                            error("未找到关联项目ID,请检测关联模块名称！")
+                        }
+                        
+                        // 新建，接受/处理，重新打开，尝试创建开发分支
+                        tools.PrintMSG("blue","新建特性分支 --> ${ProjectId} --> DEV-BUG-${workspace_id}-${responseId}")
+                        gitlab.CreateProjectBranch(ProjectId, "RELEASE-${fixVersion}", "DEV-BUG-${workspace_id}-${responseId}")
+                        currentBuild.description += "\n新建缺陷特性分支 --> ${moduleName} --> DEV-BUG-${workspace_id}-${responseId}"
+
+                        if("${status}" == "verified") {
+                            // 有关联版本，创建release分支，新建合并请求
+                            tools.PrintMSG("blue","创建Release --> ${moduleName} -->${fixVersion}分支")
+                            gitlab.CreateProjectBranch(ProjectId, "${sourceBranch}", "RELEASE-${fixVersion}")
+                            tools.PrintMSG("blue","创建合并请求 DEV-${workspace_id}-${responseId} ---> RELEASE-${fixVersion}")
+                            gitlab.CreateProjectMR(ProjectId, "DEV-BUG-${workspace_id}-${responseId}", "RELEASE-${fixVersion}", "${jobName}","${Description}")
+                            currentBuild.description += " \nIssue关联release, Jenkins创建合并请求 \nDEV-${workspace_id}-${responseId} --> RELEASE-${fixVersion}"
+                        }
+                    } else {
+                        tools.PrintMSG("blue","""ProjectName:${moduleName}""")
+                        currentBuild.description += "\n 没有关联模块"
+                    }
+                }
+            }
+        }
+
+        stage("发布计划") {
+            // 初始化发布评审 initial
+            // 在线签发 singing
+            // 发布结果确认 sign_completed
+            // 发布完成 finished
+            when {
+                allOf {
+                    anyOf {
+                        environment name: "eventType", value: "launchform::update"
+                        environment name: "eventType", value: "launchform::create"
+                    }
+                    anyOf {
+                        environment name: "status", value: "initial"
+                        environment name: "status", value: "auditing"
+                        environment name: "status", value: "sign_completed"
+                        environment name: "status", value: "finished"
+                    } 
+                }
+            }
+
+            steps {
+                // 评审通过，创建新的发布TAG
+                script {
+                    IterationsResponse = tapd.GetInfoApi("iterations",["workspace_id":"${workspace_id}", "name":"${fixVersion}"])
+                    data = readJSON text: """${IterationsResponse.content}"""
+                    IterId = data["data"]["Iteration"]["id"]
+                    moduleNames = tapd.GetIterationModules("${workspace_id}", "${IterId}")
+                    if(moduleNames && moduleNames.size() > 0) {
+                        // 有包含模块
+                        if ("${status}" == "sign_completed") {
+                            
+                            for( moduleName in moduleNames ) {
+                                ProjectId = gitlab.GetProjectId("${moduleName}")
+                                gitlab.CreateProjectTag(ProjectId, "TAG-release-${fixVersion}", "RELEASE-${fixVersion}")
+                            }
+                            currentBuild.description += "\n 迭代 ${jobName} 确认签发，创建版本TAG "
+                        } else if ("${status}" == "initial" || "${eventType}" == "launchform::create") {
+                            for( moduleName in moduleNames ) {
+                                ProjectId = gitlab.GetProjectId("${moduleName}")
+                                gitlab.CreateProjectMR(ProjectId, "RELEASE-${fixVersion}", "${sourceBranch}", "${Description}","${Description}")
+                            }
+                            currentBuild.description += "\n 迭代 ${jobName} 开始评审，创建项目合并请求 "
+                        } else if ("${status}" == "finished" && "${release_result}" == "release_success") {
+                            for( moduleName in moduleNames ) {
+                                ProjectId = gitlab.GetProjectId("${moduleName}")
+
+                                tools.PrintMSG("blue","开始获取迭代包含的需求信息")
+                                stories = tapd.GetInfoApi("stories", ["workspace_id":"${workspace_id}","iteration_id": IterId])
+                                data = readJSON text: """${stories.content}"""
+                                data["data"].each {
+                                    tools.PrintMSG("green","删除 ${moduleName} 需求特性分支 DEV-STORY-${workspace_id}-${it.Story.id}")
+                                    gitlab.DeleteProjectBranch(ProjectId, "DEV-STORY-${workspace_id}-${it.Story.id}")
+                                }
+
+                                tools.PrintMSG("blue","开始获取迭代包含的缺陷信息")
+                                bugs = tapd.GetInfoApi("bugs", [ "workspace_id":"${workspace_id}","iteration_id": IterId])
+                                data = readJSON text: """${bugs.content}"""
+                                data["data"].each { 
+                                    tools.PrintMSG("green","删除 ${moduleName} 缺陷特性分支 DEV-BUG-${workspace_id}-${it.Bug.id}")
+                                    gitlab.DeleteProjectBranch(ProjectId, "DEV-BUG-${workspace_id}-${it.Bug.id}")   
+                                }
+                    
+                                // 添加任务描述
+                                currentBuild.description += "\n 迭代 ${jobName} 发布成功，清理特性分支 "
+                            }
+                        }
+                    } else {
+                        currentBuild.description += "\n 迭代 ${jobName} 开发进度未完成 "
+                        error("${jobName} 迭代开发进度未完成")
+                    }
+                }
+            }    
+        }
+    }
+
+    post {
+        success {
+            println("success")
+        }
+
+        failure {
+            println("failure")
+        }
+
+        aborted {
+            println("aborted")
+        }
+
+        unstable {
+            println("unstable")
+        }
+    }
+}
