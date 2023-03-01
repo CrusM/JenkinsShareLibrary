@@ -1,0 +1,257 @@
+#!groovy
+// jira + jenkins + gitlab, CI/CD 流水线
+// 提交 需求,BUG 自动创建对应的 DEV-ISSUE-{tapd_id} 分支
+// 需求关闭, 自动创建合并请求, 将代码合并到 Release 分支
+// jenkins插件: generic-webhook-trigger
+@Library('JpipelineLibrary') _
+
+def gitlab = new org.devops.gitlab()
+def jira = new org.devops.jira()
+def tools = new org.devops.tools()
+
+pipeline {
+    agent any
+    
+    options {
+        // 不允许并行构建
+        disableConcurrentBuilds()
+        // 保留历史构建数量
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+    }
+    // Webhook 触发器
+    triggers {
+        GenericTrigger(causeString: 'Generic Cause', 
+                        genericVariables: [[defaultValue: '', key: 'webHookData', regexpFilter: '', value: '$.']], 
+                        regexpFilterExpression: '', 
+                        regexpFilterText: '', 
+                        token: 'jenkinslib', 
+                        tokenCredentialId: ''
+                    )
+    }
+    stages {
+        stage("FilterData") {
+            steps {
+                script {
+                    response = readJSON text: """${webHookData}"""
+                    env.eventType = response["webhookEvent"]
+
+                    switch(eventType) {
+                        case "jira:version_created":
+                            env.versionName = response["version"]["name"]
+                            currentBuild.description = " Trigger by ${eventType} ${versionName}"
+                            break
+                        case "jira:version_released":
+                            env.versionName = response["version"]["name"]
+                            currentBuild.description = " Trigger by ${eventType} ${versionName}"
+                            break
+                        case "jira:issue_created":
+                            env.userName = response["user"]["name"]
+                            env.issueName = response["issue"]["key"]
+                            env.moduleName = response["issue"]["fields"]["components"]
+                            env.fixVersion = response["issue"]["fields"]["fixVersions"]
+                            env.issueType = response["issue"]["fields"]['issuetype']['name']
+                            env.FlowStatus = response["issue"]["fields"]["status"]["id"]
+                            env.Description = response["issue"]["fields"]["description"]
+                            env.jobName = response["issue"]["fields"]["summary"]
+                            currentBuild.description = " Trigger by ${userName} ${eventType} ${issueName}"
+                            break
+                        case "jira:issue_updated":
+                            env.userName = response["user"]["name"]
+                            env.issueName = response["issue"]["key"]
+                            env.moduleName = response["issue"]["fields"]["components"]
+                            env.fixVersion = response["issue"]["fields"]["fixVersions"]
+                            env.issueType = response["issue"]["fields"]['issuetype']['name']
+                            env.FlowStatus = response["issue"]["fields"]["status"]["id"]
+                            env.Description = response["issue"]["fields"]["description"]
+                            env.jobName = response["issue"]["fields"]["summary"]
+                            currentBuild.description = " Trigger by ${userName} ${eventType} ${issueName}"
+                            break
+
+                        case "jira:version_released":
+                            env.versionName = response["version"]["name"]
+                            currentBuild.description = " Trigger by  ${eventType} ${versionName} "
+                            break
+
+                        default:
+                            PrintMSG("error","jira job: ${eventType}")
+                    }
+                }
+            }
+            
+        }
+
+        stage("Story") {
+            when {
+                allOf{
+                    environment name: "issueType", value: "故事"
+                    anyOf {
+                        environment name: "eventType", value: "jira:issue_created"
+                        environment name: "eventType", value: "jira:issue_updated"
+                    }
+                }
+                
+            }
+
+            steps {
+                script {
+                    // 定义 projectId(需求关联的工程) 列表
+                    def projectIds = []
+                    // jira：修复的版本
+                    fixVersion = readJSON text: """${fixVersion}"""
+                    // jira：关联模块
+                    projects = readJSON text: """${moduleName}"""
+                    tools.PrintMSG("blue","""projects:${projects}""")
+                    for (project in projects) {
+                        projectName = project["name"]
+                        tools.PrintMSG("blue","""projectName:${projectName}""")
+                        currentBuild.description += "\n project: ${projectName}"
+
+                        try {
+                            projectId = gitlab.GetProjectId(projectName)
+                            tools.PrintMSG("blue","""projectName:${projectName},projectId:${projectId}""")
+                            projectIds.add(projectId)
+                        } catch(e) {
+                            tools.PrintMSG("red",e)
+                            tools.PrintMSG("red","未找到关联项目ID,请检测关联模块名称！")
+                        }
+                    }
+
+                    for (id in projectIds) {
+                        // 有关联版本，且问题已解决，创建release分支
+
+                        if(fixVersion.size() > 0 && FlowStatus == "6") {
+                            tools.PrintMSG("green","问题已经解决，开始创建合并请求")
+                            for (version in fixVersion){
+                                tools.PrintMSG("green","创建Release --> ${id} -->${version.name}分支")
+                                gitlab.CreateProjectBranch(id, "master", "RELEASE-${version.name}")
+
+                                tools.PrintMSG("green","创建合并请求 ${issueName} ---> RELEASE-${version.name}")
+                                gitlab.CreateProjectMR(id, "Dev-ISSUE-${issueName}", "RELEASE-${version.name}", "${jobName}")
+                                currentBuild.description += "\n新建合并请求 --> ${id} --> Dev-ISSUE-${issueName} --->RELEASE-${version.name}"
+                            }
+                        } else {
+                            tools.PrintMSG("green","新建特性分支 --> ${id} --> ${issueName}")
+                            gitlab.CreateProjectBranch(id, "master", "Dev-ISSUE-${issueName}")
+                            currentBuild.description += "\n新建特性分支 --> ${id} --> Dev-ISSUE-${issueName}"
+                        }
+                    } 
+                }
+            }
+        }
+
+        stage("Issue") {
+            when {
+                allOf {
+                    environment name: "issueType", value: "故障"
+                    expression { return env.fixVersion.size() > 0 }
+                    anyOf {
+                        environment name: "eventType", value: "jira:issue_created"
+                        environment name: "eventType", value: "jira:issue_updated"
+                    }
+                }
+                
+            }
+
+            steps {
+                script {
+                    // 定义 projectId(需求关联的工程) 列表
+                    def projectIds = []
+                    // jira：修复的版本
+                    fixVersion = readJSON text: """${fixVersion}"""
+                    // jira：关联模块
+                    projects = readJSON text: """${moduleName}"""
+                    tools.PrintMSG("blue","""projects:${projects}""")
+                    for (project in projects) {
+                        projectName = project["name"]
+                        tools.PrintMSG("blue","""projectName:${projectName}""")
+                        currentBuild.description += "\n project: ${projectName}"
+
+                        try {
+                            projectId = gitlab.GetProjectId(projectName)
+                            tools.PrintMSG("blue","""projectName:${projectName},projectId:${projectId}""")
+                            projectIds.add(projectId)
+                        } catch(e) {
+                            tools.PrintMSG("red",e)
+                            tools.PrintMSG("red","未找到关联项目ID,请检测关联模块名称！")
+                        }
+                    }
+
+                    for (id in projectIds) {
+                        // 有关联版本，且问题已解决，创建release分支
+
+                        if(FlowStatus == "6") {
+                            tools.PrintMSG("green","问题已经解决，开始创建合并请求")
+                            for (version in fixVersion){ 
+                                tools.PrintMSG("green","创建合并请求 ${issueName} ---> RELEASE-${version.name}")
+                                gitlab.CreateProjectMR(id, "Dev-ISSUE-${issueName}", "RELEASE-${version.name}", "${jobName}")
+                                currentBuild.description += "\n新建合并请求 --> ${id} --> Dev-ISSUE-${issueName} --->RELEASE-${version.name}"
+                            }
+                        } else {
+                            for (version in fixVersion){
+                                tools.PrintMSG("green","新建特性分支 --> ${id} --> ${issueName}")
+                                gitlab.CreateProjectBranch(id, "RELEASE-${version.name}", "Dev-ISSUE-${issueName}")
+                                currentBuild.description += "\n新建特性分支 --> ${id} --> Dev-ISSUE-${issueName}"
+                            }    
+                        }
+                    } 
+                }
+            }
+        }
+
+        stage("ReleaseVersion") {
+            // 发布版本，删除特性分支
+            when {
+                environment name: "eventType", value: "jira:version_released"
+            }
+            steps{
+                script{
+                    println("project%20%3D%20${projectKey}%20AND%20fixVersion%20%3D%20${versionName}%20AND%20status%20%3D%20Closed")
+                    response = jira.RunJql("project%20%3D%20${projectKey}%20AND%20fixVersion%20%3D%20${versionName}%20AND%20status%20%3D%20Closed")
+                    
+                    response = readJSON text: """${response.content}"""
+                    println(response)
+                    issues = [:]
+                    for ( issue in response['issues']){
+                        println(issue["key"])
+                        println(issue["fields"]["components"])
+                        issues[issue["key"]] = []
+                        
+                        //获取issue关联的模块
+                        for (component in issue["fields"]["components"]){
+                            issues[issue["key"]].add(component["name"])
+                        }
+                    }
+
+                    for (issue in issues.keySet()){
+                        for (projectName in issues[issue]){
+                            // repoName = projectName.split("-")[0]
+                            projectId = gitlab.GetProjectId(projectName)
+                            
+                            try {
+                                println("创建合并请求  RELEASE-${versionName}  ---> master")
+                                result = gitlab.CreateProjectMR(projectId,"RELEASE-${versionName}","master","RELEASE-${versionName}--->master")
+                                result = readJSON text: """${result.content}"""
+                                mergeId = result["iid"]
+                                gitlab.AcceptMr(projectId,mergeId)
+                                
+                                sleep 15
+                            } catch(e){
+                                println(e)
+                            }
+                            response = gitlab.SearchProjectBranches(projectId, "Dev-ISSUE-${issue}")
+                            
+                            println(response[projectId][0]['merged'])
+                            
+                            if (response[projectId][0]['merged'] == false){
+                                println("${projectName} --> ${issue} -->此分支未合并暂时忽略！")
+                            } else {
+                                println("${projectName} --> ${issue} -->此分支已合并准备清理！")
+                                gitlab.DeleteProjectBranch(projectId,"Dev-ISSUE-${issue}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
