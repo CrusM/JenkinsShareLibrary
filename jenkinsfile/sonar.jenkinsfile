@@ -22,6 +22,18 @@ pipeline {
     parameters {
         string(name: "sonar", defaultValue: "sonar", description: "sonar")
     }
+    
+    // Webhook 触发器
+    triggers {
+        GenericTrigger(causeString: 'Generic Cause', 
+                        genericVariables: [[defaultValue: '', key: 'webHookData', regexpFilter: '', value: '$.']], 
+                        regexpFilterExpression: '', 
+                        regexpFilterText: '', 
+                        token: 'jenkinslib', 
+                        tokenCredentialId: ''
+                    )
+    }
+    
     environment{
             projectPath = "src"
             __workspace = "."
